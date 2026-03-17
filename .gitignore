@@ -1,0 +1,20 @@
+# Build output
+bin/
+obj/
+
+# Rider / JetBrains
+.idea/
+*.sln.iml
+
+# User-specific files
+*.user
+*.suo
+
+# Logs
+*.log
+
+# Game dependency copies
+lib/
+
+# Optional debug artifacts
+*.pdb
