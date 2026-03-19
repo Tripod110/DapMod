@@ -31,6 +31,10 @@
             <HintPath>D:\Modding\Schedule I\Dap Mod\lib\MelonLoader.dll</HintPath>
         </Reference>
 
+        <Reference Include="0Harmony">
+            <HintPath>C:\Program Files (x86)\Steam\steamapps\common\Schedule I\MelonLoader\net6\0Harmony.dll</HintPath>
+        </Reference>
+
         <Reference Include="UnityEngine.InputLegacyModule">
             <HintPath>D:\Modding\Schedule I\Dap Mod\lib\UnityEngine.InputLegacyModule.dll</HintPath>
         </Reference>
