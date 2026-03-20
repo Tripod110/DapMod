@@ -8,7 +8,7 @@ using UnityEngine;
 
 namespace DapMod.Core;
 
-public class MainMod : MelonMod
+public partial class MainMod : MelonMod
 {
     private static MainMod? _instance;
     private static readonly string[] GameplayBlockTargets =
@@ -34,14 +34,22 @@ public class MainMod : MelonMod
     private const float DapMaxPlayerDriftDistance = 0.85f;
     private const float DapMaxNpcDriftDistance = 0.60f;
     private const float PostDapInputBlockDuration = 0.15f;
+    private const float PostDapConversationDelay = 0.18f;
+    private const float DeferredSaveDelay = 0.20f;
     private const float DapResultBannerDuration = 2.75f;
     private const double PerformanceLogThresholdMs = 8.0;
     private const int PerfectDapXpReward = 5;
     private const float PerfectDapFriendshipReward = 0.04f;
     private const string AudioCueFolderName = "DapModAudio";
+    private const string DailyXpStateFileName = "DapModDailyXp.txt";
+    private const string DailySuccessfulDapStateFileName = "DapModDailyDaps.txt";
     private const string PerfectAudioFileName = "perfect_dap.wav";
     private const string GoodAudioFileName = "good_dap.wav";
     private const string BadAudioFileName = "bad_dap.wav";
+    private const int AnimationProbeMaxItems = 12;
+    private const float OverlayIntroDuration = 0.16f;
+    private const float AudioWarmupDelay = 1.00f;
+    private static readonly bool EnableRuntimeAudio = false;
 
     // Virtual dap cursor / minigame
     private const float DapCursorSpeed = 1.65f;
@@ -144,11 +152,20 @@ public class MainMod : MelonMod
 
     private bool _minigameActive = false;
     private Vector2 _dapCursor = Vector2.zero;
+    private float _dapOverlayStartTime = -1f;
     private float _pendingPlayerRestoreTime = -1f;
 
     private Transform? _cachedPlayerRoot = null;
+    private Component? _cachedPlayerComponent;
+    private Component? _currentNpcComponent;
+    private object? _currentNpcRelationData;
+    private string? _currentNpcRewardKey;
     private PlayerActionSnapshot? _playerActionSnapshot = null;
     private NpcPauseSnapshot? _npcPauseSnapshot = null;
+    private readonly Dictionary<int, Component> _npcComponentCache = new();
+    private readonly Dictionary<int, string> _npcRewardKeyCache = new();
+    private Type? _cachedNpcType;
+    private Type? _cachedLevelManagerType;
 
     // Overlay textures
     private Texture2D? _whiteTex;
@@ -157,36 +174,77 @@ public class MainMod : MelonMod
     private Texture2D? _perfectTex;
     private Texture2D? _goodTex;
     private Texture2D? _panelTex;
+    private GUIStyle? _overlayPanelStyle;
+    private GUIStyle? _overlayAreaStyle;
+    private GUIStyle? _overlayOutlineStyle;
+    private GUIStyle? _overlayTitleStyle;
+    private GUIStyle? _overlayHintStyle;
+    private GUIStyle? _overlayMicroStyle;
+    private GUIStyle? _overlayTagStyle;
+    private GUIStyle? _overlayCursorStyle;
+    private GUIStyle? _overlayTargetStyle;
     private GUIStyle? _resultTitleStyle;
     private GUIStyle? _resultDetailStyle;
     private string? _dapResultTitle;
     private string? _dapResultDetail;
     private float _dapResultDisplayUntil = -1f;
     private Color _dapResultAccent = Color.white;
+    private GameObject? _audioHostObject;
+    private AudioSource? _audioSource;
+    private bool _audioWarmupComplete;
+    private readonly Dictionary<string, AudioClip> _audioClipCache = new(StringComparer.OrdinalIgnoreCase);
     private Component? _cachedLevelManager;
+    private float _nextLevelManagerLookupAllowedTime;
+    private Component? _cachedGameDayProvider;
+    private Component? _cachedInteractionManager;
+    private string? _cachedGameDayMemberName;
+    private bool _attemptedGameDayProviderDiscovery;
+    private bool _warnedAboutDayFallback;
+    private bool _consumeInteractionUntilRelease;
+    private bool _allowSyntheticInteraction;
+    private Transform? _pendingDapNpc;
+    private float _pendingDapHitDistance = -1f;
+    private Transform? _pendingConversationNpc;
+    private float _pendingConversationStartTime = -1f;
+    private bool _pendingSaveSuccessfulDapState;
+    private bool _pendingSaveDailyXpState;
+    private float _pendingSaveNotBeforeTime = -1f;
     private readonly HashSet<string> _missingAudioCueWarningsShown = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _loggedAnimationProbeKeys = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> _npcLastXpRewardDayByKey = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> _npcLastSuccessfulDapDayByKey = new(StringComparer.OrdinalIgnoreCase);
+    private Animator? _activeNpcGestureAnimator;
+    private string? _npcStartGestureTrigger;
+    private string? _npcSuccessGestureTrigger;
+    private string? _npcFailGestureTrigger;
 
     public override void OnInitializeMelon()
     {
         _instance = this;
         InstallHarmonyPatches();
-        EnsureOverlayTextures();
         EnsureAudioPlaceholderDirectory();
+        LoadDailyXpRewardState();
+        LoadSuccessfulDapState();
         MelonLogger.Msg("DapMod loaded successfully. [Visible Minigame + Action Suppression Build]");
     }
 
     public override void OnUpdate()
     {
         UpdatePendingPlayerRestore();
-
-        if (Input.GetKeyDown(KeyCode.G))
-        {
-            HandleDapInput();
-        }
+        UpdateConsumedInteractionState();
+        UpdateQueuedDapStart();
+        FlushPendingStateSaves();
+        UpdateDeferredConversation();
+        WarmAudioCacheIfNeeded();
 
         if (Input.GetKeyDown(KeyCode.H))
         {
             CancelDapSession("Manual cancel.");
+        }
+
+        if (Input.GetKeyDown(KeyCode.K))
+        {
+            HandleAnimationProbeInput();
         }
 
         if (_minigameActive && Input.GetKeyDown(KeyCode.J))
@@ -203,12 +261,12 @@ public class MainMod : MelonMod
 
         if (_dapActive && _currentNpcTarget != null)
         {
-            Transform? playerRoot = FindLocalPlayerRoot();
-            if (playerRoot != null)
+            Transform? playerReference = GetPlayerReferenceTransform();
+            if (playerReference != null)
             {
-                FaceNpcTowardPlayer(playerRoot, _currentNpcTarget);
+                FaceNpcTowardPlayer(playerReference, _currentNpcTarget);
 
-                if (HasBrokenDapRange(playerRoot, _currentNpcTarget))
+                if (HasBrokenDapRange(playerReference, _currentNpcTarget))
                 {
                     CancelDapSession("Moved too far away from the dap.");
                     return;
@@ -223,12 +281,13 @@ public class MainMod : MelonMod
 
     public override void OnGUI()
     {
-        if (Event.current.type != EventType.Repaint)
+        if (Event.current == null)
         {
             return;
         }
 
         EnsureOverlayTextures();
+        GUI.depth = -1000;
 
         if (_minigameActive)
         {
@@ -241,77 +300,216 @@ public class MainMod : MelonMod
         }
     }
 
+    private void UpdateConsumedInteractionState()
+    {
+        if (_consumeInteractionUntilRelease && !Input.GetKey(KeyCode.E))
+        {
+            _consumeInteractionUntilRelease = false;
+        }
+    }
+
+    private void UpdateQueuedDapStart()
+    {
+        if (_pendingDapNpc == null || _dapActive)
+        {
+            return;
+        }
+
+        Transform pendingNpc = _pendingDapNpc;
+        float pendingHitDistance = _pendingDapHitDistance;
+        _pendingDapNpc = null;
+        _pendingDapHitDistance = -1f;
+
+        Transform? playerReference = GetPlayerReferenceTransform();
+        if (playerReference == null)
+        {
+            MelonLogger.Warning("Could not find player reference for queued dap start.");
+            return;
+        }
+
+        if (pendingNpc == null)
+        {
+            return;
+        }
+
+        float playerToNpcDistance = Vector3.Distance(playerReference.position, pendingNpc.position);
+        if (playerToNpcDistance > MaxDapStartDistance)
+        {
+            return;
+        }
+
+        StartDapSession(playerReference, pendingNpc, pendingHitDistance, playerToNpcDistance);
+    }
+
+    private void UpdateDeferredConversation()
+    {
+        if (_pendingConversationNpc == null)
+        {
+            return;
+        }
+
+        if (_pendingConversationStartTime >= 0f && Time.time < _pendingConversationStartTime)
+        {
+            return;
+        }
+
+        if (_dapActive || _pendingPlayerRestoreTime >= 0f || _consumeInteractionUntilRelease)
+        {
+            return;
+        }
+
+        Transform pendingNpc = _pendingConversationNpc;
+        _pendingConversationNpc = null;
+        _pendingConversationStartTime = -1f;
+
+        if (!TryTriggerConversation(pendingNpc))
+        {
+            MelonLogger.Warning($"Could not auto-start conversation after dap with {pendingNpc.name}. Press E to talk normally.");
+        }
+    }
+
+    private void FlushPendingStateSaves()
+    {
+        if (!_pendingSaveSuccessfulDapState && !_pendingSaveDailyXpState)
+        {
+            return;
+        }
+
+        if (_pendingSaveNotBeforeTime >= 0f && Time.time < _pendingSaveNotBeforeTime)
+        {
+            return;
+        }
+
+        if (_pendingSaveSuccessfulDapState)
+        {
+            SaveSuccessfulDapState();
+            _pendingSaveSuccessfulDapState = false;
+        }
+
+        if (_pendingSaveDailyXpState)
+        {
+            SaveDailyXpRewardState();
+            _pendingSaveDailyXpState = false;
+        }
+
+        _pendingSaveNotBeforeTime = -1f;
+    }
+
     // -----------------------------
     // Session flow
     // -----------------------------
 
-    private void HandleDapInput()
+    private bool HandleInteractionCheck(object? interactionManagerInstance)
     {
+        if (interactionManagerInstance is Component interactionManagerComponent)
+        {
+            _cachedInteractionManager = interactionManagerComponent;
+
+            Transform? interactionDerivedRoot = ResolvePlayerRootFromTransform(interactionManagerComponent.transform, allowLooseFallback: true);
+            if (interactionDerivedRoot != null)
+            {
+                _cachedPlayerRoot = interactionDerivedRoot;
+            }
+        }
+
+        if (_allowSyntheticInteraction)
+        {
+            return true;
+        }
+
+        if (_consumeInteractionUntilRelease)
+        {
+            return false;
+        }
+
+        if (!Input.GetKeyDown(KeyCode.E))
+        {
+            return true;
+        }
+
         if (Time.time < _nextAllowedDapTime)
         {
-            float remaining = _nextAllowedDapTime - Time.time;
-            MelonLogger.Msg($"Dap on cooldown for {remaining:F2}s");
-            return;
+            return false;
         }
 
         if (_dapActive)
         {
-            MelonLogger.Msg($"Dap session already active with: {_currentNpcTarget?.name ?? "<unknown>"}");
-            return;
+            return false;
         }
 
         if (!TryGetDappableNpcTarget(out Transform npcRoot, out float hitDistance))
         {
-            if (VerboseLogging)
-            {
-                MelonLogger.Msg("No valid dappable NPC target found.");
-            }
-
-            return;
+            return true;
         }
 
-        Transform? playerRoot = FindLocalPlayerRoot();
-        if (playerRoot == null)
+        Transform? playerReference = GetPlayerReferenceTransform();
+        if (playerReference == null)
         {
-            MelonLogger.Warning("Could not find local player root.");
-            return;
+            MelonLogger.Warning("Could not find player reference.");
+            return true;
         }
 
-        float playerToNpcDistance = Vector3.Distance(playerRoot.position, npcRoot.position);
+        float playerToNpcDistance = Vector3.Distance(playerReference.position, npcRoot.position);
         if (playerToNpcDistance > MaxDapStartDistance)
         {
-            MelonLogger.Msg(
-                $"Target too far to start dap. Player->NPC: {playerToNpcDistance:F2} / Max: {MaxDapStartDistance:F2} (Ray hit: {hitDistance:F2})");
-            _nextAllowedDapTime = Time.time + 0.20f;
-            return;
+            return true;
         }
 
-        if (!IsNpcFacingPlayer(playerRoot, npcRoot))
+        if (!IsNpcFacingPlayer(playerReference, npcRoot))
         {
-            MelonLogger.Msg("Rejected dap: NPC is not facing the player.");
-            _nextAllowedDapTime = Time.time + 0.20f;
-            return;
+            return true;
         }
 
-        StartDapSession(playerRoot, npcRoot, hitDistance, playerToNpcDistance);
+        _consumeInteractionUntilRelease = true;
+        _pendingDapNpc = npcRoot;
+        _pendingDapHitDistance = hitDistance;
+        return false;
     }
 
-    private void StartDapSession(Transform playerRoot, Transform npcRoot, float hitDistance, float playerToNpcDistance)
+    private void HandleAnimationProbeInput()
+    {
+        Transform? playerReference = GetPlayerReferenceTransform();
+        if (playerReference == null)
+        {
+            MelonLogger.Warning("Animation probe failed: could not find player reference.");
+            return;
+        }
+
+        if (TryGetDappableNpcTarget(out Transform npcRoot, out _))
+        {
+            ProbeAnimationOptions(playerReference, npcRoot, true);
+            return;
+        }
+
+        MelonLogger.Msg("Animation probe: aim at a valid NPC and press K.");
+    }
+
+    private void StartDapSession(Transform playerReference, Transform npcRoot, float hitDistance, float playerToNpcDistance)
     {
         Stopwatch stopwatch = Stopwatch.StartNew();
+        double cacheMs = 0d;
+        double playerSuppressMs = 0d;
+        double npcPauseMs = 0d;
 
         try
         {
             _dapActive = true;
             _currentNpcTarget = npcRoot;
             _dapStartTime = Time.time;
-            _dapOriginPlayerPosition = playerRoot.position;
+            _dapOriginPlayerPosition = playerReference.position;
             _dapOriginNpcPosition = npcRoot.position;
+            CacheRewardTargetsForSession(npcRoot);
+            PrepareNpcGestureProfile(npcRoot);
+            cacheMs = stopwatch.Elapsed.TotalMilliseconds;
 
-            SuppressPlayerActions(playerRoot);
+            Transform playerActionRoot = FindLocalPlayerRoot() ?? playerReference;
+            SuppressPlayerActions(playerActionRoot);
+            playerSuppressMs = stopwatch.Elapsed.TotalMilliseconds - cacheMs;
             PauseNpcBehavior(npcRoot);
-            FaceNpcTowardPlayer(playerRoot, npcRoot);
+            npcPauseMs = stopwatch.Elapsed.TotalMilliseconds - cacheMs - playerSuppressMs;
+            FaceNpcTowardPlayer(playerReference, npcRoot);
             MaintainNpcLock();
+            PlayNpcGestureCue(NpcGestureCue.Start);
             BeginDapMinigame();
             stopwatch.Stop();
 
@@ -321,7 +519,7 @@ public class MainMod : MelonMod
             if (stopwatch.Elapsed.TotalMilliseconds >= PerformanceLogThresholdMs)
             {
                 MelonLogger.Warning(
-                    $"Dap setup hitch detected: {stopwatch.Elapsed.TotalMilliseconds:F1}ms (player disable {_playerActionSnapshot?.Behaviours.Count ?? 0} / npc pause {_npcPauseSnapshot?.Behaviours.Count ?? 0})");
+                    $"Dap setup hitch detected: {stopwatch.Elapsed.TotalMilliseconds:F1}ms (cache {cacheMs:F1}ms / player {playerSuppressMs:F1}ms / npc {npcPauseMs:F1}ms)");
             }
         }
         catch (Exception ex)
@@ -335,6 +533,7 @@ public class MainMod : MelonMod
     {
         _minigameActive = true;
         _dapCursor = DapCursorStart;
+        _dapOverlayStartTime = Time.time;
         _dapResultDisplayUntil = -1f;
         _dapResultTitle = null;
         _dapResultDetail = null;
@@ -425,22 +624,35 @@ public class MainMod : MelonMod
         int xpAwarded = 0;
         float friendshipAwarded = 0f;
         Stopwatch stopwatch = Stopwatch.StartNew();
+        double rewardMs = 0d;
+        double resetMs = 0d;
 
         try
         {
             MelonLogger.Msg($"Dap success with {_currentNpcTarget?.name ?? "<unknown>"} | {result}");
 
+            Transform? successfulNpc = _currentNpcTarget;
             ApplyDapRewards(result, out xpAwarded, out friendshipAwarded);
+            rewardMs = stopwatch.Elapsed.TotalMilliseconds;
+            PlayNpcGestureCue(NpcGestureCue.Success);
             ShowDapResultBanner(result, xpAwarded, friendshipAwarded);
+            if (successfulNpc != null)
+            {
+                _pendingConversationNpc = successfulNpc;
+                _pendingConversationStartTime = Time.time + PostDapConversationDelay;
+            }
+
             _nextAllowedDapTime = Time.time + DapRetryCooldown;
             ResetDapState();
+            resetMs = stopwatch.Elapsed.TotalMilliseconds - rewardMs;
             stopwatch.Stop();
 
             QueueDapAudioPlaceholder(result);
 
             if (stopwatch.Elapsed.TotalMilliseconds >= PerformanceLogThresholdMs)
             {
-                MelonLogger.Warning($"Dap completion hitch detected: {stopwatch.Elapsed.TotalMilliseconds:F1}ms");
+                MelonLogger.Warning(
+                    $"Dap completion hitch detected: {stopwatch.Elapsed.TotalMilliseconds:F1}ms (rewards {rewardMs:F1}ms / reset {resetMs:F1}ms)");
             }
         }
         catch (Exception ex)
@@ -463,6 +675,7 @@ public class MainMod : MelonMod
         {
             MelonLogger.Msg($"Dap cancelled with {_currentNpcTarget?.name ?? "<unknown>"} | {reason}");
 
+            PlayNpcGestureCue(NpcGestureCue.Fail);
             ShowCancelledDapBanner(reason);
             _nextAllowedDapTime = Time.time + DapRetryCooldown;
             ResetDapState();
@@ -498,6 +711,14 @@ public class MainMod : MelonMod
         _dapOriginNpcPosition = Vector3.zero;
         _minigameActive = false;
         _dapCursor = Vector2.zero;
+        _dapOverlayStartTime = -1f;
+        _currentNpcComponent = null;
+        _currentNpcRelationData = null;
+        _currentNpcRewardKey = null;
+        _activeNpcGestureAnimator = null;
+        _npcStartGestureTrigger = null;
+        _npcSuccessGestureTrigger = null;
+        _npcFailGestureTrigger = null;
     }
 
     private void EmergencyResetDapState(string reason, Exception ex)
@@ -531,7 +752,10 @@ public class MainMod : MelonMod
     private static bool ShouldBlockGameplayActions()
     {
         return _instance != null &&
-               (_instance._dapActive || _instance._pendingPlayerRestoreTime >= 0f);
+               !_instance._allowSyntheticInteraction &&
+               (_instance._dapActive ||
+                _instance._pendingPlayerRestoreTime >= 0f ||
+                _instance._consumeInteractionUntilRelease);
     }
 
     private void InstallHarmonyPatches()
@@ -542,7 +766,7 @@ public class MainMod : MelonMod
 
         foreach (string target in GameplayBlockTargets)
         {
-            MethodBase? method = AccessTools.Method(target);
+            MethodBase? method = ResolveGameplayBlockTargetMethod(target);
             if (method == null)
             {
                 MelonLogger.Warning($"Could not find dap gameplay blocker target: {target}");
@@ -553,26 +777,86 @@ public class MainMod : MelonMod
         }
     }
 
-    private static bool BlockGameplayActionsPrefix()
+    private static bool BlockGameplayActionsPrefix(MethodBase __originalMethod, object? __instance)
     {
+        if (_instance != null &&
+            __originalMethod.Name.Equals("CheckInteraction", StringComparison.Ordinal))
+        {
+            return _instance.HandleInteractionCheck(__instance);
+        }
+
         return !ShouldBlockGameplayActions();
     }
 
+    private static MethodBase? ResolveGameplayBlockTargetMethod(string target)
+    {
+        int separatorIndex = target.IndexOf(':');
+        if (separatorIndex <= 0 || separatorIndex >= target.Length - 1)
+        {
+            return null;
+        }
+
+        string typeName = target.Substring(0, separatorIndex);
+        string methodName = target[(separatorIndex + 1)..];
+
+        Type? type = ResolveLoadedType(typeName);
+        if (type == null && typeName.StartsWith("Il2Cpp", StringComparison.Ordinal))
+        {
+            type = ResolveLoadedType(typeName.Substring("Il2Cpp".Length));
+        }
+
+        if (type == null)
+        {
+            return null;
+        }
+
+        MethodInfo[] methods = type.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+        foreach (MethodInfo method in methods)
+        {
+            if (method.Name.Equals(methodName, StringComparison.Ordinal))
+            {
+                return method;
+            }
+        }
+
+        return null;
+    }
+
+    private static Type? ResolveLoadedType(string fullName)
+    {
+        foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            Type? type = assembly.GetType(fullName, false);
+            if (type != null)
+            {
+                return type;
+            }
+        }
+
+        return null;
+    }
+
+    #if false
     private void ApplyDapRewards(DapResult result, out int xpAwarded, out float friendshipAwarded)
     {
         xpAwarded = 0;
         friendshipAwarded = 0f;
 
-        if (result != DapResult.Perfect)
+        if (_currentNpcTarget == null)
         {
             return;
         }
 
-        bool xpApplied = AwardPlayerXp(PerfectDapXpReward);
-        bool friendshipApplied = _currentNpcTarget != null &&
-                                 AwardNpcFriendship(_currentNpcTarget, PerfectDapFriendshipReward);
+        if (result != DapResult.Perfect && result != DapResult.Good)
+        {
+            return;
+        }
 
-        if (xpApplied)
+        bool friendshipApplied = AwardNpcFriendship(_currentNpcTarget, PerfectDapFriendshipReward);
+        bool xpApplied = result == DapResult.Perfect &&
+                         TryAwardDailyNpcXp(_currentNpcTarget, PerfectDapXpReward);
+
+        if (result == DapResult.Perfect && xpApplied)
         {
             xpAwarded = PerfectDapXpReward;
         }
@@ -583,7 +867,7 @@ public class MainMod : MelonMod
         }
 
         MelonLogger.Msg(
-            $"Perfect dap rewards -> XP: {(xpApplied ? PerfectDapXpReward.ToString() : "failed")}, Friendship: {(friendshipApplied ? PerfectDapFriendshipReward.ToString("F2") : "failed")}");
+            $"Dap rewards -> Result: {result}, XP: {(xpApplied ? PerfectDapXpReward.ToString() : "none")}, Friendship: {(friendshipApplied ? PerfectDapFriendshipReward.ToString("F2") : "failed")}");
     }
 
     private void QueueDapAudioPlaceholder(DapResult result)
@@ -644,6 +928,660 @@ public class MainMod : MelonMod
         return System.IO.Path.Combine(GetAudioPlaceholderDirectory(), fileName);
     }
 
+    private bool TryAwardDailyNpcXp(Transform npcRoot, int amount)
+    {
+        if (amount <= 0)
+        {
+            return false;
+        }
+
+        string npcKey = GetNpcRewardKey(npcRoot);
+        int currentDayIndex = GetCurrentRewardDayIndex();
+
+        if (_npcLastXpRewardDayByKey.TryGetValue(npcKey, out int lastRewardDay) &&
+            lastRewardDay == currentDayIndex)
+        {
+            MelonLogger.Msg($"Daily dap XP already claimed for {npcRoot.name} on day {currentDayIndex}.");
+            return false;
+        }
+
+        if (!AwardPlayerXp(amount))
+        {
+            return false;
+        }
+
+        _npcLastXpRewardDayByKey[npcKey] = currentDayIndex;
+        _pendingSaveDailyXpState = true;
+        _pendingSaveNotBeforeTime = Time.time + DeferredSaveDelay;
+        return true;
+    }
+
+    private int GetCurrentRewardDayIndex()
+    {
+        if (TryGetCurrentGameDayIndex(out int gameDayIndex))
+        {
+            return gameDayIndex;
+        }
+
+        if (!_warnedAboutDayFallback)
+        {
+            _warnedAboutDayFallback = true;
+            MelonLogger.Warning("Could not resolve the in-game day. Falling back to real-world date for daily dap XP limits.");
+        }
+
+        return int.Parse(DateTime.UtcNow.ToString("yyyyMMdd"));
+    }
+
+    private bool TryGetCurrentGameDayIndex(out int dayIndex)
+    {
+        dayIndex = -1;
+
+        if (_cachedGameDayProvider != null &&
+            !string.IsNullOrEmpty(_cachedGameDayMemberName) &&
+            TryReadGameDayFromMemberPath(_cachedGameDayProvider, _cachedGameDayMemberName!, out dayIndex))
+        {
+            return true;
+        }
+
+        if (_attemptedGameDayProviderDiscovery)
+        {
+            return false;
+        }
+
+        _attemptedGameDayProviderDiscovery = true;
+
+        foreach (Component component in GetLikelyGameDayProviderCandidates())
+        {
+            if (component == null)
+            {
+                continue;
+            }
+
+            if (TryResolveGameDayMemberPath(component, out string memberPath, out dayIndex))
+            {
+                _cachedGameDayProvider = component;
+                _cachedGameDayMemberName = memberPath;
+                MelonLogger.Msg($"Resolved game day provider: {GetComponentTypeName(component)} -> {memberPath}");
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private Component[] GetLikelyGameDayProviderCandidates()
+    {
+        List<Component> candidates = new List<Component>();
+
+        try
+        {
+            foreach (Component component in UnityEngine.Object.FindObjectsOfType<Component>(true))
+            {
+                if (component != null && IsLikelyGameDayProvider(component))
+                {
+                    candidates.Add(component);
+                }
+            }
+        }
+        catch
+        {
+            try
+            {
+                foreach (Component component in Resources.FindObjectsOfTypeAll<Component>())
+                {
+                    if (component != null && IsLikelyGameDayProvider(component))
+                    {
+                        candidates.Add(component);
+                    }
+                }
+            }
+            catch
+            {
+                // ignored
+            }
+        }
+
+        return candidates.ToArray();
+    }
+
+    private static bool IsLikelyGameDayProvider(Component component)
+    {
+        string typeName = GetComponentTypeName(component);
+        return typeName.Contains("Time", StringComparison.OrdinalIgnoreCase) ||
+               typeName.Contains("Day", StringComparison.OrdinalIgnoreCase) ||
+               typeName.Contains("Clock", StringComparison.OrdinalIgnoreCase) ||
+               typeName.Contains("Session", StringComparison.OrdinalIgnoreCase) ||
+               typeName.Contains("World", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool TryResolveGameDayMemberPath(object provider, out string memberPath, out int dayIndex)
+    {
+        memberPath = string.Empty;
+        dayIndex = -1;
+
+        string[] directMembers =
+        {
+            "CurrentDay",
+            "Day",
+            "DayNumber",
+            "CurrentDayIndex",
+            "ElapsedDays",
+            "DaysPassed",
+            "TotalDays"
+        };
+
+        foreach (string memberName in directMembers)
+        {
+            if (TryReadGameDayFromMemberPath(provider, memberName, out dayIndex))
+            {
+                memberPath = memberName;
+                return true;
+            }
+        }
+
+        string[] nestedMembers =
+        {
+            "Time",
+            "CurrentTime",
+            "Clock",
+            "Date",
+            "WorldTime",
+            "Session",
+            "SaveData"
+        };
+
+        foreach (string outerMember in nestedMembers)
+        {
+            object? nested = GetObjectMemberValue(provider, outerMember);
+            if (nested == null)
+            {
+                continue;
+            }
+
+            foreach (string innerMember in directMembers)
+            {
+                string candidatePath = $"{outerMember}.{innerMember}";
+                if (TryReadGameDayFromMemberPath(provider, candidatePath, out dayIndex))
+                {
+                    memberPath = candidatePath;
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private bool TryReadGameDayFromMemberPath(object provider, string memberPath, out int dayIndex)
+    {
+        dayIndex = -1;
+        object? current = provider;
+
+        string[] segments = memberPath.Split('.');
+        foreach (string segment in segments)
+        {
+            if (current == null)
+            {
+                return false;
+            }
+
+            current = GetObjectMemberValue(current, segment);
+        }
+
+        return TryConvertToDayIndex(current, out dayIndex);
+    }
+
+    private static bool TryConvertToDayIndex(object? value, out int dayIndex)
+    {
+        dayIndex = -1;
+        if (value == null)
+        {
+            return false;
+        }
+
+        try
+        {
+            switch (value)
+            {
+                case int i:
+                    dayIndex = i;
+                    return true;
+                case long l when l >= int.MinValue && l <= int.MaxValue:
+                    dayIndex = (int)l;
+                    return true;
+                case short s:
+                    dayIndex = s;
+                    return true;
+                case byte b:
+                    dayIndex = b;
+                    return true;
+                case float f:
+                    dayIndex = Mathf.FloorToInt(f);
+                    return true;
+                case double d:
+                    dayIndex = (int)Math.Floor(d);
+                    return true;
+                case decimal m:
+                    dayIndex = (int)Math.Floor((double)m);
+                    return true;
+                case string text when int.TryParse(text, out int parsed):
+                    dayIndex = parsed;
+                    return true;
+            }
+
+            if (value.GetType().IsEnum)
+            {
+                dayIndex = Convert.ToInt32(value);
+                return true;
+            }
+        }
+        catch
+        {
+            // ignored
+        }
+
+        return false;
+    }
+
+    private void LoadDailyXpRewardState()
+    {
+        _npcLastXpRewardDayByKey.Clear();
+
+        string path = GetDailyXpRewardStatePath();
+        if (!System.IO.File.Exists(path))
+        {
+            return;
+        }
+
+        try
+        {
+            string[] lines = System.IO.File.ReadAllLines(path);
+            foreach (string rawLine in lines)
+            {
+                if (string.IsNullOrWhiteSpace(rawLine))
+                {
+                    continue;
+                }
+
+                string[] parts = rawLine.Split('\t');
+                if (parts.Length != 2)
+                {
+                    continue;
+                }
+
+                if (int.TryParse(parts[1], out int dayIndex))
+                {
+                    _npcLastXpRewardDayByKey[parts[0]] = dayIndex;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"Could not load dap daily XP state: {ex.Message}");
+        }
+    }
+
+    private bool HasSuccessfulDapToday(Transform npcRoot)
+    {
+        string npcKey = GetNpcRewardKey(npcRoot);
+        int currentDayIndex = GetCurrentRewardDayIndex();
+        return _npcLastSuccessfulDapDayByKey.TryGetValue(npcKey, out int lastSuccessfulDay) &&
+               lastSuccessfulDay == currentDayIndex;
+    }
+
+    private void MarkSuccessfulDapToday(Transform npcRoot)
+    {
+        string npcKey = GetNpcRewardKey(npcRoot);
+        _npcLastSuccessfulDapDayByKey[npcKey] = GetCurrentRewardDayIndex();
+        _pendingSaveSuccessfulDapState = true;
+        _pendingSaveNotBeforeTime = Time.time + DeferredSaveDelay;
+    }
+
+    private void LoadSuccessfulDapState()
+    {
+        _npcLastSuccessfulDapDayByKey.Clear();
+
+        string path = GetSuccessfulDapStatePath();
+        if (!System.IO.File.Exists(path))
+        {
+            return;
+        }
+
+        try
+        {
+            string[] lines = System.IO.File.ReadAllLines(path);
+            foreach (string rawLine in lines)
+            {
+                if (string.IsNullOrWhiteSpace(rawLine))
+                {
+                    continue;
+                }
+
+                string[] parts = rawLine.Split('\t');
+                if (parts.Length != 2)
+                {
+                    continue;
+                }
+
+                if (int.TryParse(parts[1], out int dayIndex))
+                {
+                    _npcLastSuccessfulDapDayByKey[parts[0]] = dayIndex;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"Could not load dap daily success state: {ex.Message}");
+        }
+    }
+
+    private void SaveSuccessfulDapState()
+    {
+        try
+        {
+            List<string> lines = new List<string>(_npcLastSuccessfulDapDayByKey.Count);
+            foreach (KeyValuePair<string, int> kvp in _npcLastSuccessfulDapDayByKey)
+            {
+                lines.Add($"{kvp.Key}\t{kvp.Value}");
+            }
+
+            System.IO.File.WriteAllLines(GetSuccessfulDapStatePath(), lines);
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"Could not save dap daily success state: {ex.Message}");
+        }
+    }
+
+    private void SaveDailyXpRewardState()
+    {
+        try
+        {
+            List<string> lines = new List<string>(_npcLastXpRewardDayByKey.Count);
+            foreach (KeyValuePair<string, int> kvp in _npcLastXpRewardDayByKey)
+            {
+                lines.Add($"{kvp.Key}\t{kvp.Value}");
+            }
+
+            System.IO.File.WriteAllLines(GetDailyXpRewardStatePath(), lines);
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"Could not save dap daily XP state: {ex.Message}");
+        }
+    }
+
+    private static string GetDailyXpRewardStatePath()
+    {
+        return System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "UserData", DailyXpStateFileName);
+    }
+
+    private static string GetSuccessfulDapStatePath()
+    {
+        return System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "UserData", DailySuccessfulDapStateFileName);
+    }
+
+    private string GetNpcRewardKey(Transform npcRoot)
+    {
+        Component? npcComponent = FindComponentByTypeName(
+            npcRoot.GetComponentsInChildren<Component>(true),
+            "Il2CppScheduleOne.NPCs.NPC");
+
+        if (npcComponent != null)
+        {
+            string[] memberCandidates =
+            {
+                "ID",
+                "NPCID",
+                "Guid",
+                "GUID",
+                "FullName",
+                "FirstName",
+                "Name"
+            };
+
+            foreach (string memberName in memberCandidates)
+            {
+                object? value = GetObjectMemberValue(npcComponent, memberName);
+                if (value != null)
+                {
+                    string text = value.ToString() ?? string.Empty;
+                    if (!string.IsNullOrWhiteSpace(text))
+                    {
+                        return text.Trim();
+                    }
+                }
+            }
+        }
+
+        return BuildTransformPath(npcRoot);
+    }
+
+    private bool TryTriggerConversation(Transform npcRoot)
+    {
+        try
+        {
+            _allowSyntheticInteraction = true;
+
+            Component? npcComponent = FindComponentByTypeName(
+                npcRoot.GetComponentsInChildren<Component>(true),
+                "Il2CppScheduleOne.NPCs.NPC");
+
+            if (npcComponent != null &&
+                TryInvokeObjectMethodByNames(npcComponent,
+                    "Interact",
+                    "StartConversation",
+                    "OpenConversation",
+                    "Talk"))
+            {
+                return true;
+            }
+
+            Component? interactionManager = FindInteractionManager();
+            if (interactionManager != null)
+            {
+                object? interactableTarget = FindInteractionTarget(interactionManager);
+
+                if (TryInvokeObjectMethodByNames(interactionManager,
+                        "Interact",
+                        "StartInteraction",
+                        "AttemptInteract",
+                        "TryInteract",
+                        "TriggerInteraction",
+                        "CheckInteraction"))
+                {
+                    return true;
+                }
+
+                if (interactableTarget != null &&
+                    TryInvokeObjectMethodByNames(interactableTarget,
+                        "Interact",
+                        "StartInteraction",
+                        "StartConversation",
+                        "OpenConversation",
+                        "Talk"))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+        finally
+        {
+            _allowSyntheticInteraction = false;
+        }
+    }
+
+    private Component? FindInteractionManager()
+    {
+        if (_cachedInteractionManager != null)
+        {
+            return _cachedInteractionManager;
+        }
+
+        _cachedInteractionManager = FindFirstLoadedComponentByTypeName("Il2CppScheduleOne.Interaction.InteractionManager") ??
+                                    FindFirstLoadedComponentByTypeName("ScheduleOne.Interaction.InteractionManager");
+        return _cachedInteractionManager;
+    }
+
+    private static object? FindInteractionTarget(object interactionManager)
+    {
+        string[] memberCandidates =
+        {
+            "CurrentInteractable",
+            "currentInteractable",
+            "HoveredInteractable",
+            "hoveredInteractable",
+            "CurrentTarget",
+            "currentTarget",
+            "Target"
+        };
+
+        foreach (string memberName in memberCandidates)
+        {
+            object? target = GetObjectMemberValue(interactionManager, memberName);
+            if (target != null)
+            {
+                return target;
+            }
+        }
+
+        return null;
+    }
+
+    private static string BuildTransformPath(Transform transform)
+    {
+        List<string> segments = new List<string>();
+        Transform? current = transform;
+        while (current != null)
+        {
+            segments.Add(current.name ?? "<unnamed>");
+            current = current.parent;
+        }
+
+        segments.Reverse();
+        return string.Join("/", segments.ToArray());
+    }
+
+    #endif
+    private void ProbeAnimationOptions(Transform playerRoot, Transform npcRoot, bool forceLog)
+    {
+        string probeKey = $"{playerRoot.name}->{npcRoot.name}";
+        if (!forceLog && !_loggedAnimationProbeKeys.Add(probeKey))
+        {
+            return;
+        }
+
+        MelonLogger.Msg("=== Dap Animation Probe ===");
+        LogAnimatorSummary("Player", playerRoot);
+        LogAnimatorSummary("NPC", npcRoot);
+        MelonLogger.Msg("Press K while aiming at an NPC to rescan animation options.");
+        MelonLogger.Msg("===========================");
+    }
+
+    private void LogAnimatorSummary(string label, Transform root)
+    {
+        Animator[] animators = root.GetComponentsInChildren<Animator>(true);
+        MelonLogger.Msg($"{label} animator count: {animators.Length}");
+
+        for (int i = 0; i < animators.Length; i++)
+        {
+            Animator animator = animators[i];
+            if (animator == null)
+            {
+                continue;
+            }
+
+            List<string> parameterNames = CollectAnimatorParameterHints(animator);
+            List<string> clipNames = CollectAnimatorClipHints(animator);
+
+            string parameterText = parameterNames.Count > 0 ? string.Join(", ", parameterNames.ToArray()) : "<none>";
+            string clipText = clipNames.Count > 0 ? string.Join(", ", clipNames.ToArray()) : "<none>";
+
+            MelonLogger.Msg($"{label} Animator[{i}] {animator.name} params: {parameterText}");
+            MelonLogger.Msg($"{label} Animator[{i}] {animator.name} clips: {clipText}");
+        }
+    }
+
+    private List<string> CollectAnimatorParameterHints(Animator animator)
+    {
+        List<string> likely = new List<string>();
+        List<string> fallback = new List<string>();
+
+        foreach (AnimatorControllerParameter parameter in animator.parameters)
+        {
+            string descriptor = $"{parameter.name}:{parameter.type}";
+            if (IsLikelyDapAnimationName(parameter.name))
+            {
+                AddUniqueLimited(likely, descriptor, AnimationProbeMaxItems);
+            }
+            else
+            {
+                AddUniqueLimited(fallback, descriptor, AnimationProbeMaxItems);
+            }
+        }
+
+        return likely.Count > 0 ? likely : fallback;
+    }
+
+    private List<string> CollectAnimatorClipHints(Animator animator)
+    {
+        List<string> likely = new List<string>();
+        List<string> fallback = new List<string>();
+
+        RuntimeAnimatorController? controller = animator.runtimeAnimatorController;
+        AnimationClip[] clips = controller != null ? controller.animationClips : Array.Empty<AnimationClip>();
+        foreach (AnimationClip clip in clips)
+        {
+            if (clip == null)
+            {
+                continue;
+            }
+
+            if (IsLikelyDapAnimationName(clip.name))
+            {
+                AddUniqueLimited(likely, clip.name, AnimationProbeMaxItems);
+            }
+            else
+            {
+                AddUniqueLimited(fallback, clip.name, AnimationProbeMaxItems);
+            }
+        }
+
+        return likely.Count > 0 ? likely : fallback;
+    }
+
+    private static bool IsLikelyDapAnimationName(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        return value.Contains("greet", StringComparison.OrdinalIgnoreCase) ||
+               value.Contains("wave", StringComparison.OrdinalIgnoreCase) ||
+               value.Contains("shake", StringComparison.OrdinalIgnoreCase) ||
+               value.Contains("hand", StringComparison.OrdinalIgnoreCase) ||
+               value.Contains("hello", StringComparison.OrdinalIgnoreCase) ||
+               value.Contains("interact", StringComparison.OrdinalIgnoreCase) ||
+               value.Contains("talk", StringComparison.OrdinalIgnoreCase) ||
+               value.Contains("gesture", StringComparison.OrdinalIgnoreCase) ||
+               value.Contains("emote", StringComparison.OrdinalIgnoreCase) ||
+               value.Contains("dap", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void AddUniqueLimited(List<string> values, string value, int maxItems)
+    {
+        if (values.Count >= maxItems || values.Contains(value))
+        {
+            return;
+        }
+
+        values.Add(value);
+    }
+
+    #if false
     private void ShowDapResultBanner(DapResult result, int xpAwarded, float friendshipAwarded)
     {
         switch (result)
@@ -658,7 +1596,7 @@ public class MainMod : MelonMod
             case DapResult.Good:
                 SetDapResultBanner(
                     "good dap",
-                    "+0 xp   +0.00 friendship",
+                    $"+0 xp   +{friendshipAwarded:F2} friendship",
                     new Color(1f, 0.86f, 0.58f, 1f));
                 break;
 
@@ -716,7 +1654,22 @@ public class MainMod : MelonMod
         }
 
         if (TryInvokeObjectMethod(levelManager, "AddXP", amount) ||
-            TryInvokeObjectMethod(levelManager, "AddXPLocal", amount))
+            TryInvokeObjectMethod(levelManager, "AddXPLocal", amount) ||
+            TryInvokeObjectMethod(levelManager, "AddExperience", amount) ||
+            TryInvokeObjectMethod(levelManager, "GiveXP", amount) ||
+            TryInvokeObjectMethod(levelManager, "GiveExperience", amount) ||
+            TryInvokeObjectMethod(levelManager, "RewardXP", amount))
+        {
+            return true;
+        }
+
+        if (TryAdjustNumericMember(levelManager, amount,
+                "XP",
+                "CurrentXP",
+                "Experience",
+                "CurrentExperience",
+                "TotalXP",
+                "TotalExperience"))
         {
             return true;
         }
@@ -749,19 +1702,37 @@ public class MainMod : MelonMod
             return false;
         }
 
-        if (TryInvokeObjectMethod(relationData, "ChangeRelationship", amount, true))
+        if (TryInvokeObjectMethod(relationData, "ChangeRelationship", amount, true) ||
+            TryInvokeObjectMethod(relationData, "ChangeRelationship", amount) ||
+            TryInvokeObjectMethod(relationData, "AddRelationship", amount) ||
+            TryInvokeObjectMethod(relationData, "ModifyRelationship", amount) ||
+            TryInvokeObjectMethod(relationData, "AddFriendship", amount) ||
+            TryInvokeObjectMethod(relationData, "ChangeFriendship", amount))
         {
             return true;
         }
 
-        MelonLogger.Warning("Could not apply dap friendship reward because ChangeRelationship was not callable.");
+        if (TryAdjustNumericMember(relationData, amount,
+                "Relationship",
+                "CurrentRelationship",
+                "Friendship",
+                "CurrentFriendship",
+                "FriendshipLevel",
+                "Value"))
+        {
+            return true;
+        }
+
+        MelonLogger.Warning("Could not apply dap friendship reward because no relationship member or method was callable.");
         return false;
     }
 
+    #endif
     // -----------------------------
     // Targeting / player lookup
     // -----------------------------
 
+    #if false
     private bool TryGetDappableNpcTarget(out Transform npcRoot, out float hitDistance)
     {
         npcRoot = null!;
@@ -817,29 +1788,155 @@ public class MainMod : MelonMod
     {
         if (_cachedPlayerRoot != null)
         {
-            return _cachedPlayerRoot;
+            try
+            {
+                if (_cachedPlayerRoot.gameObject != null)
+                {
+                    return _cachedPlayerRoot;
+                }
+            }
+            catch
+            {
+                _cachedPlayerRoot = null;
+            }
         }
 
-        Transform[] allTransforms = UnityEngine.Object.FindObjectsOfType<Transform>();
-
-        foreach (Transform transform in allTransforms)
+        Camera? mainCamera = Camera.main;
+        if (mainCamera != null)
         {
-            if (transform.parent != null)
+            Transform? cameraDerivedRoot = ResolvePlayerRootFromTransform(mainCamera.transform, allowLooseFallback: true);
+            if (cameraDerivedRoot != null)
             {
-                continue;
-            }
-
-            string name = transform.name ?? string.Empty;
-
-            if (name.StartsWith("Tripod ("))
-            {
-                _cachedPlayerRoot = transform;
-                MelonLogger.Msg($"Cached player root: {_cachedPlayerRoot.name}");
+                _cachedPlayerRoot = cameraDerivedRoot;
+                MelonLogger.Msg($"Cached player root from camera: {_cachedPlayerRoot.name}");
                 return _cachedPlayerRoot;
             }
         }
 
+        Component? playerComponent = FindFirstLoadedComponentByTypeName("Il2CppScheduleOne.PlayerScripts.Player") ??
+                                     FindFirstLoadedComponentByTypeName("ScheduleOne.PlayerScripts.Player");
+        if (playerComponent != null)
+        {
+            Transform? playerComponentRoot = ResolvePlayerRootFromTransform(playerComponent.transform, allowLooseFallback: true);
+            if (playerComponentRoot != null)
+            {
+                _cachedPlayerRoot = playerComponentRoot;
+                MelonLogger.Msg($"Cached player root from player component: {_cachedPlayerRoot.name}");
+                return _cachedPlayerRoot;
+            }
+        }
+
+        Transform[] allTransforms = Resources.FindObjectsOfTypeAll<Transform>();
+        foreach (Transform transform in allTransforms)
+        {
+            Transform? resolvedRoot = ResolvePlayerRootFromTransform(transform, allowLooseFallback: false);
+            if (resolvedRoot == null)
+            {
+                continue;
+            }
+
+            _cachedPlayerRoot = resolvedRoot;
+            MelonLogger.Msg($"Cached player root from transform scan: {_cachedPlayerRoot.name}");
+            return _cachedPlayerRoot;
+        }
+
         return null;
+    }
+
+    private Transform? ResolvePlayerRootFromTransform(Transform? source, bool allowLooseFallback)
+    {
+        if (source == null)
+        {
+            return null;
+        }
+
+        Transform current = source;
+        while (current.parent != null)
+        {
+            current = current.parent;
+        }
+
+        if (IsLikelyPlayerRoot(current))
+        {
+            return current;
+        }
+
+        Transform root = source.root;
+        if (root != null && IsLikelyPlayerRoot(root))
+        {
+            return root;
+        }
+
+        Transform walker = source;
+        while (walker != null)
+        {
+            if (IsLikelyPlayerRoot(walker))
+            {
+                return walker;
+            }
+
+            walker = walker.parent;
+        }
+
+        if (allowLooseFallback)
+        {
+            Transform? looseFallback = FindLoosePlayerAncestor(source);
+            if (looseFallback != null)
+            {
+                return looseFallback;
+            }
+
+            return root != null ? root : source;
+        }
+
+        return null;
+    }
+
+    private static Transform? FindLoosePlayerAncestor(Transform source)
+    {
+        Transform? walker = source;
+        while (walker != null)
+        {
+            string name = walker.name ?? string.Empty;
+            if (name.Contains("Tripod", StringComparison.OrdinalIgnoreCase) ||
+                name.Contains("CameraContainer", StringComparison.OrdinalIgnoreCase) ||
+                name.Contains("BodyContainer", StringComparison.OrdinalIgnoreCase) ||
+                name.Contains("Player", StringComparison.OrdinalIgnoreCase))
+            {
+                return walker;
+            }
+
+            walker = walker.parent;
+        }
+
+        return null;
+    }
+
+    private bool IsLikelyPlayerRoot(Transform transform)
+    {
+        string name = transform.name ?? string.Empty;
+        if (name.StartsWith("Tripod (", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        Component[] components = transform.GetComponentsInChildren<Component>(true);
+        foreach (Component component in components)
+        {
+            if (component == null)
+            {
+                continue;
+            }
+
+            string fullName = component.GetType().FullName ?? string.Empty;
+            if (fullName.Equals("Il2CppScheduleOne.PlayerScripts.Player", StringComparison.Ordinal) ||
+                fullName.Equals("ScheduleOne.PlayerScripts.Player", StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private bool IsNpcFacingPlayer(Transform playerRoot, Transform npcRoot)
@@ -919,6 +2016,7 @@ public class MainMod : MelonMod
         return currentDistance > MaxDapStartDistance;
     }
 
+    #endif
     // -----------------------------
     // Player action suppression
     // -----------------------------
@@ -1070,7 +2168,10 @@ public class MainMod : MelonMod
                 Speed = animator.speed
             });
 
-            animator.speed = 0f;
+            if (animator != _activeNpcGestureAnimator)
+            {
+                animator.speed = 0f;
+            }
         }
 
         Rigidbody[] rigidbodies = npcRoot.GetComponentsInChildren<Rigidbody>(true);
@@ -1284,6 +2385,7 @@ public class MainMod : MelonMod
     // Reflection helpers
     // -----------------------------
 
+    #if false
     private static string GetComponentTypeName(Component component)
     {
         Type type = component.GetType();
@@ -1557,6 +2659,91 @@ public class MainMod : MelonMod
         return null;
     }
 
+    private static bool TryAdjustNumericMember(object instance, float delta, params string[] memberNames)
+    {
+        const BindingFlags Flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+
+        Type type = instance.GetType();
+        foreach (string memberName in memberNames)
+        {
+            PropertyInfo? property = type.GetProperty(memberName, Flags);
+            MethodInfo? getter = property?.GetGetMethod(true);
+            MethodInfo? setter = property?.GetSetMethod(true);
+            if (property != null && getter != null && setter != null &&
+                TryConvertAdjustedValue(getter.Invoke(instance, Array.Empty<object>()), delta, property.PropertyType, out object? adjustedValue))
+            {
+                try
+                {
+                    setter.Invoke(instance, new[] { adjustedValue });
+                    return true;
+                }
+                catch
+                {
+                    // ignored
+                }
+            }
+
+            FieldInfo? field = type.GetField(memberName, Flags);
+            if (field != null &&
+                TryConvertAdjustedValue(field.GetValue(instance), delta, field.FieldType, out adjustedValue))
+            {
+                try
+                {
+                    field.SetValue(instance, adjustedValue);
+                    return true;
+                }
+                catch
+                {
+                    // ignored
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryConvertAdjustedValue(object? currentValue, float delta, Type targetType, out object? adjustedValue)
+    {
+        adjustedValue = null;
+        if (currentValue == null)
+        {
+            return false;
+        }
+
+        try
+        {
+            if (targetType == typeof(float))
+            {
+                adjustedValue = Convert.ToSingle(currentValue) + delta;
+                return true;
+            }
+
+            if (targetType == typeof(double))
+            {
+                adjustedValue = Convert.ToDouble(currentValue) + delta;
+                return true;
+            }
+
+            if (targetType == typeof(int))
+            {
+                adjustedValue = Mathf.RoundToInt(Convert.ToSingle(currentValue) + delta);
+                return true;
+            }
+
+            if (targetType == typeof(long))
+            {
+                adjustedValue = Convert.ToInt64(Mathf.RoundToInt(Convert.ToSingle(currentValue) + delta));
+                return true;
+            }
+        }
+        catch
+        {
+            // ignored
+        }
+
+        return false;
+    }
+
     private static bool TryInvokeObjectMethod(object instance, string methodName, params object?[] args)
     {
         MethodInfo? method = FindCompatibleMethod(instance.GetType(), methodName, args);
@@ -1576,6 +2763,19 @@ public class MainMod : MelonMod
         }
     }
 
+    private static bool TryInvokeObjectMethodByNames(object instance, params string[] methodNames)
+    {
+        foreach (string methodName in methodNames)
+        {
+            if (TryInvokeObjectMethod(instance, methodName))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     // -----------------------------
     // Overlay rendering
     // -----------------------------
@@ -1588,6 +2788,15 @@ public class MainMod : MelonMod
         _perfectTex ??= MakeSolidTex(new Color(0.60f, 1f, 0.82f, 0.92f));
         _goodTex ??= MakeSolidTex(new Color(1f, 0.86f, 0.58f, 0.80f));
         _panelTex ??= MakeSolidTex(new Color(0.03f, 0.04f, 0.06f, 0.30f));
+        _overlayPanelStyle ??= MakePanelStyle(new Color(0.05f, 0.07f, 0.10f, 0.92f));
+        _overlayAreaStyle ??= MakePanelStyle(new Color(0.03f, 0.05f, 0.08f, 0.98f));
+        _overlayOutlineStyle ??= MakePanelStyle(new Color(0.90f, 0.93f, 0.97f, 0.95f));
+        _overlayTitleStyle ??= MakeLabelStyle(18, FontStyle.Bold, Color.white, TextAnchor.MiddleCenter);
+        _overlayHintStyle ??= MakeLabelStyle(13, FontStyle.Normal, new Color(0.92f, 0.95f, 0.98f, 0.98f), TextAnchor.MiddleCenter);
+        _overlayMicroStyle ??= MakeLabelStyle(11, FontStyle.Normal, new Color(0.74f, 0.80f, 0.88f, 1f), TextAnchor.MiddleCenter);
+        _overlayTagStyle ??= MakeLabelStyle(11, FontStyle.Bold, new Color(0.14f, 0.16f, 0.19f, 1f), TextAnchor.MiddleCenter);
+        _overlayCursorStyle ??= MakeLabelStyle(26, FontStyle.Bold, new Color(0.70f, 0.93f, 1f, 1f), TextAnchor.MiddleCenter);
+        _overlayTargetStyle ??= MakeLabelStyle(28, FontStyle.Bold, Color.white, TextAnchor.MiddleCenter);
         _resultTitleStyle ??= MakeLabelStyle(15, FontStyle.Bold, Color.white);
         _resultDetailStyle ??= MakeLabelStyle(12, FontStyle.Normal, new Color(0.90f, 0.93f, 0.97f, 0.96f));
     }
@@ -1602,56 +2811,51 @@ public class MainMod : MelonMod
 
     private void DrawDapOverlay()
     {
-        float boxSize = OverlayScale;
-        float boxX = (Screen.width * 0.5f) - (boxSize * 0.5f);
-        float boxY = Screen.height - boxSize - 78f;
+        float boxSize = Mathf.Max(252f, OverlayScale + 56f);
+        float boxX = (Screen.width * 0.5f) - (boxSize * 0.5f) + 128f;
+        float boxY = (Screen.height * 0.5f) - (boxSize * 0.5f) + 10f;
 
-        Rect panelRect = new Rect(boxX - 10f, boxY - 30f, boxSize + 20f, boxSize + 58f);
-        GUI.DrawTexture(panelRect, _panelTex!);
-
+        Rect panelRect = new Rect(boxX - 32f, boxY - 86f, boxSize + 64f, boxSize + 174f);
         Rect areaRect = new Rect(boxX, boxY, boxSize, boxSize);
-        DrawRect(areaRect, _blackTex!);
-        DrawOutline(areaRect, 1f, _whiteTex!);
+        Vector2 perfectPoint = NormalizedPointToPixels(PerfectZoneCenter, areaRect);
+        Vector2 startPoint = NormalizedPointToPixels(DapCursorStart, areaRect);
+        Vector2 cursorPoint = NormalizedPointToPixels(_dapCursor, areaRect);
 
-        float goodDiameter = GoodZoneRadius * 2f * boxSize;
+        DrawOutlinedLabel(new Rect(panelRect.x, panelRect.y + 8f, panelRect.width, 28f), "DAP UP", _overlayTitleStyle!, Color.white);
+        DrawOutlinedLabel(new Rect(panelRect.x, panelRect.y + 38f, panelRect.width, 20f), "move the O with your mouse and click on the +", _overlayHintStyle!, Color.white);
+        DrawOutlinedLabel(new Rect(panelRect.x, areaRect.yMax + 8f, panelRect.width, 22f), "left click while your cursor is on center", _overlayHintStyle!, Color.white);
+        DrawOutlinedLabel(new Rect(panelRect.x, areaRect.yMax + 30f, panelRect.width, 20f), "a clean dap rolls straight into conversation", _overlayMicroStyle!, new Color(0.86f, 0.91f, 0.98f, 1f));
+
+        for (int i = 1; i <= 7; i++)
+        {
+            float t = i / 8f;
+            Vector2 dotPoint = Vector2.Lerp(startPoint, perfectPoint, t);
+            DrawOutlinedLabel(new Rect(dotPoint.x - 8f, dotPoint.y - 8f, 16f, 16f), ".", _overlayMicroStyle!, new Color(1f, 1f, 1f, 0.78f));
+        }
+
+        float goodDiameter = Mathf.Max(88f, GoodZoneRadius * 2f * boxSize);
         Rect goodRect = NormalizedRectToPixels(PerfectZoneCenter, goodDiameter, goodDiameter, areaRect);
-        DrawOutline(goodRect, 1f, _goodTex!);
-
-        float perfectDiameter = PerfectZoneRadius * 2f * boxSize;
-        Rect perfectRect = NormalizedRectToPixels(PerfectZoneCenter, perfectDiameter, perfectDiameter, areaRect);
-        DrawOutline(perfectRect, 1.5f, _perfectTex!);
-
-        Rect centerDotRect = NormalizedRectToPixels(PerfectZoneCenter, CenterDotSize, CenterDotSize, areaRect);
-        GUI.DrawTexture(centerDotRect, _whiteTex!);
-
-        Rect cursorRect = NormalizedRectToPixels(_dapCursor, CursorPixelSize, CursorPixelSize, areaRect);
-        GUI.DrawTexture(cursorRect, _cursorTex!);
-
-        Vector2 startPx = NormalizedPointToPixels(DapCursorStart, areaRect);
-        Vector2 targetPx = NormalizedPointToPixels(PerfectZoneCenter, areaRect);
-        DrawLine(startPx, targetPx, 1f, new Color(0.92f, 0.95f, 1f, 0.16f));
-
-        Rect startRect = NormalizedRectToPixels(DapCursorStart, 5f, 5f, areaRect);
-        GUI.DrawTexture(startRect, _whiteTex!);
-
-        GUI.Label(new Rect(boxX, boxY - 22f, boxSize + 40f, 20f), "dap");
-        GUI.Label(new Rect(boxX, boxY + boxSize + 4f, boxSize + 160f, 20f), "stay close and click on center");
+        DrawOutlinedLabel(new Rect(goodRect.x - 14f, goodRect.y - 26f, goodRect.width + 28f, 18f), "GOOD", _overlayMicroStyle!, new Color(1f, 0.90f, 0.45f, 1f));
+        DrawOutlinedLabel(new Rect(perfectPoint.x - 54f, perfectPoint.y + 20f, 108f, 18f), "PERFECT", _overlayMicroStyle!, new Color(0.68f, 1f, 0.84f, 1f));
+        DrawOutlinedLabel(new Rect(perfectPoint.x - 24f, perfectPoint.y - 26f, 48f, 52f), "+", _overlayTargetStyle!, new Color(0.68f, 1f, 0.84f, 1f));
+        DrawOutlinedLabel(new Rect(startPoint.x + 12f, startPoint.y - 10f, 70f, 20f), "START", _overlayMicroStyle!, Color.white);
+        DrawOutlinedLabel(new Rect(cursorPoint.x - 18f, cursorPoint.y - 20f, 36f, 36f), "O", _overlayCursorStyle!, new Color(0.70f, 0.93f, 1f, 1f));
     }
 
     private void DrawDapResultBanner()
     {
-        float width = 320f;
-        float height = 68f;
+        float width = 360f;
+        float height = 78f;
         float x = (Screen.width - width) * 0.5f;
-        float y = Screen.height - height - 132f;
+        float y = Screen.height - height - 96f;
 
         Rect panelRect = new Rect(x, y, width, height);
-        GUI.DrawTexture(panelRect, _panelTex!);
-        DrawOutline(panelRect, 1f, _whiteTex!);
+        GUI.DrawTexture(panelRect, _blackTex!);
+        DrawOutline(panelRect, 1.5f, _whiteTex!);
 
         Color oldColor = GUI.color;
         GUI.color = _dapResultAccent;
-        GUI.DrawTexture(new Rect(x + 10f, y + 10f, 3f, height - 20f), _whiteTex!);
+        GUI.DrawTexture(new Rect(x + 12f, y + 12f, 4f, height - 24f), _whiteTex!);
         GUI.color = oldColor;
 
         GUI.Label(
@@ -1707,13 +2911,27 @@ public class MainMod : MelonMod
         GUI.color = oldColor;
     }
 
-    private static GUIStyle MakeLabelStyle(int fontSize, FontStyle fontStyle, Color textColor)
+    private static GUIStyle MakePanelStyle(Color backgroundColor)
+    {
+        Texture2D background = new Texture2D(1, 1, TextureFormat.RGBA32, false);
+        background.SetPixel(0, 0, backgroundColor);
+        background.Apply();
+
+        GUIStyle style = new GUIStyle(GUI.skin.box);
+        style.normal.background = background;
+        style.border = new RectOffset(0, 0, 0, 0);
+        style.padding = new RectOffset(0, 0, 0, 0);
+        style.margin = new RectOffset(0, 0, 0, 0);
+        return style;
+    }
+
+    private static GUIStyle MakeLabelStyle(int fontSize, FontStyle fontStyle, Color textColor, TextAnchor alignment = TextAnchor.MiddleLeft)
     {
         GUIStyle style = new GUIStyle(GUI.skin.label)
         {
             fontSize = fontSize,
             fontStyle = fontStyle,
-            alignment = TextAnchor.MiddleLeft,
+            alignment = alignment,
             richText = false
         };
 
@@ -1726,4 +2944,19 @@ public class MainMod : MelonMod
         style.normal.textColor = textColor;
         return style;
     }
+
+    private static void DrawOutlinedLabel(Rect rect, string text, GUIStyle style, Color textColor)
+    {
+        Color oldColor = style.normal.textColor;
+        style.normal.textColor = Color.black;
+        GUI.Label(new Rect(rect.x - 1f, rect.y, rect.width, rect.height), text, style);
+        GUI.Label(new Rect(rect.x + 1f, rect.y, rect.width, rect.height), text, style);
+        GUI.Label(new Rect(rect.x, rect.y - 1f, rect.width, rect.height), text, style);
+        GUI.Label(new Rect(rect.x, rect.y + 1f, rect.width, rect.height), text, style);
+
+        style.normal.textColor = textColor;
+        GUI.Label(rect, text, style);
+        style.normal.textColor = oldColor;
+    }
+    #endif
 }
